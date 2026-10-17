@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound, forbidden } from '../utils/response';
 import { notifyWingAdmins, residentLabel } from '../services/notification.service';
+import { issueActivationCode, formatActivationCode, pinSummaryOf } from '../services/pin.service';
 
 const RELATIONS = ['SPOUSE', 'CHILD', 'PARENT', 'SIBLING', 'OTHER'] as const;
 
@@ -14,18 +15,25 @@ const addSchema = z.object({
 
 // Any resident of the flat can view the family list; only the head-of-family
 // (isPrimary) can add or remove members. Login itself needs no changes —
-// each member has their own phone number and logs in with the existing
-// phone + OTP flow, same as any resident.
+// each member has their own phone number and signs in with their own PIN.
+// The head of family hands over the one-time activation code (and can reset
+// a family member's forgotten PIN), the same way the Secretary does for residents.
 export async function listFamilyMembers(req: Request, res: Response) {
   const flatId = req.user.flat_id;
   if (!flatId) return badRequest(res, 'No flat associated with your account');
 
   const members = await prisma.user.findMany({
     where: { flatId, role: 'RESIDENT', isActive: true },
-    select: { id: true, name: true, phone: true, isPrimary: true, familyRelation: true, createdAt: true },
+    select: {
+      id: true, name: true, phone: true, isPrimary: true, familyRelation: true, createdAt: true,
+      pinSetAt: true, activationCodeHash: true, activationExpiresAt: true,
+    },
     orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
   });
-  return ok(res, members);
+  return ok(res, members.map(({ pinSetAt, activationCodeHash, activationExpiresAt, ...m }) => ({
+    ...m,
+    pin: pinSummaryOf({ pinSetAt, activationCodeHash, activationExpiresAt }),
+  })));
 }
 
 export async function addFamilyMember(req: Request, res: Response) {
@@ -63,7 +71,12 @@ export async function addFamilyMember(req: Request, res: Response) {
       relatedId: member.id,
     }),
   );
-  return created(res, member, 'Family member added — they can log in with their own phone number');
+  const issued = await issueActivationCode(member.id);
+  return created(
+    res,
+    { id: member.id, name: member.name, phone: member.phone, activation: { code: formatActivationCode(issued.code), expiresAt: issued.expiresAt } },
+    'Family member added. Share the activation code with them.',
+  );
 }
 
 export async function removeFamilyMember(req: Request, res: Response) {
@@ -87,4 +100,23 @@ export async function removeFamilyMember(req: Request, res: Response) {
     }),
   );
   return ok(res, null, 'Family member removed');
+}
+
+// Head of family: a family member forgot their PIN. Issues a fresh one-time code.
+export async function resetFamilyMemberPin(req: Request, res: Response) {
+  const requester = await prisma.user.findUnique({ where: { id: req.user.user_id } });
+  if (!requester?.isPrimary) return forbidden(res, 'Only the head of family can reset a family member\'s PIN');
+
+  const member = await prisma.user.findFirst({
+    where: { id: req.params.id, flatId: req.user.flat_id ?? undefined, role: 'RESIDENT', isActive: true },
+  });
+  if (!member) return notFound(res, 'Family member not found');
+  if (member.isPrimary) return badRequest(res, 'Use the Change PIN option for your own account');
+
+  const issued = await issueActivationCode(member.id, { resetPin: true });
+  return ok(
+    res,
+    { id: member.id, name: member.name, phone: member.phone, activation: { code: formatActivationCode(issued.code), expiresAt: issued.expiresAt } },
+    'PIN reset. Share the new code.',
+  );
 }

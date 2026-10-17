@@ -2,6 +2,12 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound } from '../utils/response';
+import { codeIfNeeded, issueActivationCode, phoneConflict, pinSummaryOf, IssuedCode } from '../services/pin.service';
+
+// What the Command Centre shows once, right after a code is issued.
+function activationPayload(c: IssuedCode | null) {
+  return c ? { code: c.formatted, expiresAt: c.expiresAt } : null;
+}
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
 
@@ -78,15 +84,11 @@ const createSocietySchema = z.object({
   mapAddress: z.string().optional(),
 });
 
-function generateDemoOtpCode(): string {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
 export async function createSociety(req: Request, res: Response) {
   const parsed = createSocietySchema.safeParse(req.body);
   if (!parsed.success) return badRequest(res, parsed.error.errors[0].message);
   const newSociety = await prisma.society.create({
-    data: { ...parsed.data, demoOtpCode: generateDemoOtpCode() } as any,
+    data: parsed.data as any,
   });
 
   const trialEnd = new Date();
@@ -123,18 +125,6 @@ export async function updateSociety(req: Request, res: Response) {
   if (!society) return notFound(res, 'Society not found');
   const updated = await prisma.society.update({ where: { id }, data: parsed.data });
   return ok(res, updated);
-}
-
-export async function regenerateSocietyOtp(req: Request, res: Response) {
-  const { id } = req.params;
-  const society = await prisma.society.findUnique({ where: { id } });
-  if (!society) return notFound(res, 'Society not found');
-
-  const updated = await prisma.society.update({
-    where: { id },
-    data: { demoOtpCode: generateDemoOtpCode() },
-  });
-  return ok(res, { demoOtpCode: updated.demoOtpCode }, 'New login code generated');
 }
 
 export async function deleteSociety(req: Request, res: Response) {
@@ -264,15 +254,23 @@ export async function createWing(req: Request, res: Response) {
     await prisma.flat.createMany({ data: flats });
   }
 
+  let secretaryActivation: ReturnType<typeof activationPayload> = null;
   if (secretary_name && secretary_phone) {
-    await prisma.user.upsert({
+    const existing = await prisma.user.findUnique({ where: { phone: secretary_phone } });
+    const conflict = phoneConflict(existing, { role: 'WING_ADMIN', wingId: wing.id });
+    if (conflict) {
+      // The wing itself is already created; report the problem without hiding that.
+      return created(res, { ...wing, societyName: society.name, flatsCreated, secretaryError: conflict });
+    }
+    const secretary = await prisma.user.upsert({
       where: { phone: secretary_phone },
       create: { name: secretary_name, phone: secretary_phone, role: 'WING_ADMIN', societyId: society_id, wingId: wing.id, isPrimary: true },
       update: { name: secretary_name, role: 'WING_ADMIN', societyId: society_id, wingId: wing.id, isPrimary: true, isActive: true },
     });
+    secretaryActivation = activationPayload(await codeIfNeeded(secretary.id, existing));
   }
 
-  return created(res, { ...wing, societyName: society.name, flatsCreated });
+  return created(res, { ...wing, societyName: society.name, flatsCreated, secretaryActivation });
 }
 
 export async function getWingDetail(req: Request, res: Response) {
@@ -296,13 +294,19 @@ export async function getWingDetail(req: Request, res: Response) {
       },
       users: {
         where: { role: 'WING_ADMIN', isActive: true },
-        select: { id: true, name: true, phone: true, isPrimary: true },
+        select: { id: true, name: true, phone: true, isPrimary: true, pinSetAt: true, activationCodeHash: true, activationExpiresAt: true },
         orderBy: { createdAt: 'asc' },
       },
     },
   });
 
   if (!wing) return notFound(res, 'Wing not found');
+
+  // Show sign-in status (never the hashes) next to each Secretary.
+  (wing as any).users = (wing.users as any[]).map(({ pinSetAt, activationCodeHash, activationExpiresAt, ...rest }) => ({
+    ...rest,
+    pin: pinSummaryOf({ pinSetAt, activationCodeHash, activationExpiresAt }),
+  }));
 
   const totalFlats = wing.flats.length;
   const occupiedFlatsArr = wing.flats.filter((f) => f.users.length > 0);
@@ -360,6 +364,13 @@ export async function setWingSecretary(req: Request, res: Response) {
   const wing = await prisma.wing.findUnique({ where: { id: wingId } });
   if (!wing) return notFound(res, 'Wing not found');
 
+  const existingForPhone = await prisma.user.findUnique({ where: { phone } });
+  const conflict = phoneConflict(existingForPhone, { role: 'WING_ADMIN', wingId });
+  // A resident of this same wing can be promoted; only block real conflicts.
+  if (conflict && !(existingForPhone && existingForPhone.isActive && existingForPhone.wingId === wingId && existingForPhone.role === 'RESIDENT')) {
+    return badRequest(res, conflict);
+  }
+
   let isPrimaryForNew: boolean;
 
   if (replaceUserId) {
@@ -384,8 +395,9 @@ export async function setWingSecretary(req: Request, res: Response) {
     create: { name, phone, role: 'WING_ADMIN', societyId: wing.societyId, wingId, isPrimary: isPrimaryForNew },
     update: { name, role: 'WING_ADMIN', societyId: wing.societyId, wingId, isPrimary: isPrimaryForNew, isActive: true },
   });
+  const activation = activationPayload(await codeIfNeeded(secretary.id, existingForPhone));
 
-  return created(res, { id: secretary.id, name: secretary.name, phone: secretary.phone, isPrimary: secretary.isPrimary });
+  return created(res, { id: secretary.id, name: secretary.name, phone: secretary.phone, isPrimary: secretary.isPrimary, activation });
 }
 
 // ─── Wing Residents ───────────────────────────────────────────────────────────
@@ -465,6 +477,15 @@ export async function addResidentToFlat(req: Request, res: Response) {
     return badRequest(res, `This flat already has ${currentCount} resident${currentCount !== 1 ? 's' : ''}. Maximum 2 logins allowed per flat.`);
   }
 
+  // Check every number before creating anyone, so a conflict never leaves half the flat added.
+  const before = new Map<string, any>();
+  for (const r of parsed.data.residents) {
+    const existing = await prisma.user.findUnique({ where: { phone: r.phone } });
+    const conflict = phoneConflict(existing, { role: 'RESIDENT', wingId: flat.wingId });
+    if (conflict) return badRequest(res, `${r.phone}: ${conflict}`);
+    before.set(r.phone, existing);
+  }
+
   const results = [];
   for (const r of parsed.data.residents) {
     const user = await prisma.user.upsert({
@@ -488,7 +509,8 @@ export async function addResidentToFlat(req: Request, res: Response) {
         isActive: true,
       },
     });
-    results.push({ id: user.id, name: user.name });
+    const activation = activationPayload(await codeIfNeeded(user.id, before.get(r.phone) ?? null));
+    results.push({ id: user.id, name: user.name, phone: user.phone, activation });
   }
 
   // Write familyMembers to the Flat record so the Super Admin resident count is correct.
@@ -558,4 +580,16 @@ export async function deleteWing(req: Request, res: Response) {
     console.error('Delete wing error:', error.message);
     return res.status(500).json({ success: false, message: error.message });
   }
+}
+
+
+// ─── Reset someone's PIN (forgotten PIN, or handing an account to a new person) ──
+export async function resetUserPin(req: Request, res: Response) {
+  const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+  if (!user || !user.isActive || user.role === 'GUARD') return notFound(res, 'User not found');
+  if (user.role === 'SUPER_ADMIN') {
+    return badRequest(res, 'Platform administrators are reset by the platform owner, not from here.');
+  }
+  const issued = await issueActivationCode(user.id, { resetPin: true });
+  return ok(res, { name: user.name, phone: user.phone, activation: activationPayload(issued) }, 'PIN reset. Share the new code.');
 }

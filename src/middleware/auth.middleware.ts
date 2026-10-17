@@ -15,7 +15,7 @@ declare global {
 // single request, while still closing access within seconds of a person being
 // deactivated or logging in on another device (access tokens live 30 days, so
 // without this a removed family member would keep working until expiry).
-type CacheEntry = { active: boolean; sessionId: string | null; checkedAt: number };
+type CacheEntry = { active: boolean; sessionId: string | null; validAfter: number; checkedAt: number };
 const authCache = new Map<string, CacheEntry>();
 const CACHE_TTL_MS = 30_000;
 
@@ -42,9 +42,14 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     if (!entry || Date.now() - entry.checkedAt >= CACHE_TTL_MS) {
       const user = await prisma.user.findUnique({
         where: { id: payload.user_id },
-        select: { isActive: true, sessionId: true },
+        select: { isActive: true, sessionId: true, sessionsValidAfter: true },
       });
-      entry = { active: !!user?.isActive, sessionId: user?.sessionId ?? null, checkedAt: Date.now() };
+      entry = {
+        active: !!user?.isActive,
+        sessionId: user?.sessionId ?? null,
+        validAfter: user?.sessionsValidAfter ? Math.floor(user.sessionsValidAfter.getTime() / 1000) : 0,
+        checkedAt: Date.now(),
+      };
       authCache.set(payload.user_id, entry);
     }
     if (!entry.active) {
@@ -57,6 +62,11 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     // 'web' tokens are Command Centre admin sessions, which are not limited to one device.
     if (entry.sessionId && payload.sid !== 'web' && payload.sid !== entry.sessionId) {
       return unauthorized(res, 'You were signed out because this account was logged in on another device.');
+    }
+    // A PIN reset or change signs out everything issued before it — including
+    // Command Centre ('web') sessions, which the check above does not cover.
+    if (entry.validAfter && (payload.iat ?? 0) < entry.validAfter) {
+      return unauthorized(res, 'Your PIN was changed. Please sign in again.');
     }
   } catch (err) {
     // If the DB check itself fails (transient outage), don't lock everyone

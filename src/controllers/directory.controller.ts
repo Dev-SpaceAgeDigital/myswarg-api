@@ -2,6 +2,18 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound } from '../utils/response';
+import { codeIfNeeded, issueActivationCode, phoneConflict, pinSummaryOf, IssuedCode } from '../services/pin.service';
+
+// What the app shows once, right after a code is issued.
+function activationPayload(c: IssuedCode | null) {
+  return c ? { code: c.formatted, expiresAt: c.expiresAt } : null;
+}
+
+// Adds a safe sign-in status to a person and drops the hashes before sending.
+function withPinSummary<T extends { pinSetAt?: Date | null; activationCodeHash?: string | null; activationExpiresAt?: Date | null }>(u: T) {
+  const { pinSetAt, activationCodeHash, activationExpiresAt, ...rest } = u as any;
+  return { ...rest, pin: pinSummaryOf({ pinSetAt: pinSetAt ?? null, activationCodeHash: activationCodeHash ?? null, activationExpiresAt: activationExpiresAt ?? null }) };
+}
 
 const createFlatSchema = z.object({
   number: z.string().min(1),
@@ -64,13 +76,14 @@ export async function listFlats(req: Request, res: Response) {
           select: {
             id: true, name: true, phone: true, role: true,
             residentType: true, leaseStart: true, leaseEnd: true,
+            pinSetAt: true, activationCodeHash: true, activationExpiresAt: true,
           },
         },
       },
       orderBy: [{ floor: 'asc' }, { number: 'asc' }],
     });
 
-    return ok(res, flats);
+    return ok(res, flats.map((f) => ({ ...f, users: f.users.map(withPinSummary) })));
   } catch (err: any) {
     console.error('[listFlats] Error:', err.message);
     return res.status(500).json({ success: false, message: err.message });
@@ -87,7 +100,10 @@ export async function getFlatDetail(req: Request, res: Response) {
   const [residents, vehicles, recentBills] = await Promise.all([
     prisma.user.findMany({
       where: { flatId: flat.id, isActive: true },
-      select: { id: true, name: true, phone: true, role: true, residentType: true },
+      select: {
+        id: true, name: true, phone: true, role: true, residentType: true,
+        pinSetAt: true, activationCodeHash: true, activationExpiresAt: true,
+      },
     }),
     prisma.vehicle.findMany({
       where: { flatId: flat.id },
@@ -101,7 +117,7 @@ export async function getFlatDetail(req: Request, res: Response) {
     }),
   ]);
 
-  return ok(res, { flat, residents, vehicles, recentBills });
+  return ok(res, { flat, residents: residents.map(withPinSummary), vehicles, recentBills });
 }
 
 export async function createFlat(req: Request, res: Response) {
@@ -143,7 +159,15 @@ export async function addResident(req: Request, res: Response) {
     return badRequest(res, `This flat already has ${currentCount} resident(s). Maximum 2 logins allowed per flat.`);
   }
 
-  console.log(`[addResident] flatId:${flatId} primary:${primaryResident.phone} wingId:${req.user.wing_id}`);
+  // Check every number before creating anyone, so a conflict never leaves half the flat added.
+  const people = [primaryResident, ...(secondResident ? [secondResident] : [])];
+  const before = new Map<string, any>();
+  for (const person of people) {
+    const existing = await prisma.user.findUnique({ where: { phone: person.phone } });
+    const conflict = phoneConflict(existing, { role: 'RESIDENT', wingId: req.user.wing_id });
+    if (conflict) return badRequest(res, `${person.phone}: ${conflict}`);
+    before.set(person.phone, existing);
+  }
 
   const primary = await prisma.user.upsert({
     where: { phone: primaryResident.phone },
@@ -170,8 +194,9 @@ export async function addResident(req: Request, res: Response) {
     },
   });
 
+  let second: { id: string; name: string; phone: string } | null = null;
   if (secondResident) {
-    await prisma.user.upsert({
+    second = await prisma.user.upsert({
       where: { phone: secondResident.phone },
       create: {
         name: secondResident.name,
@@ -197,7 +222,6 @@ export async function addResident(req: Request, res: Response) {
     });
   }
 
-  console.log(`[addResident] Success — resident ${primary.name} linked to flat ${flat.number} (${flatId})`);
   await prisma.flat.update({ where: { id: flatId }, data: { familyMembers } });
 
   if (vehicles && vehicles.length > 0) {
@@ -212,7 +236,14 @@ export async function addResident(req: Request, res: Response) {
     });
   }
 
-  return created(res, { id: primary.id, name: primary.name }, 'Resident added');
+  // One-time activation codes: shown once to the Secretary, who hands them over.
+  const activations = [];
+  for (const person of [primary, ...(second ? [second] : [])]) {
+    const issued = await codeIfNeeded(person.id, before.get(person.phone) ?? null);
+    activations.push({ id: person.id, name: person.name, phone: person.phone, activation: activationPayload(issued) });
+  }
+
+  return created(res, { id: primary.id, name: primary.name, activations }, 'Resident added');
 }
 
 export async function removeResident(req: Request, res: Response) {
@@ -307,13 +338,25 @@ export async function updateResident(req: Request, res: Response) {
   });
   if (!user) return notFound(res, 'Resident not found');
 
+  const phoneChanged = phone !== user.phone;
+  if (phoneChanged) {
+    const taken = await prisma.user.findUnique({ where: { phone } });
+    if (taken) return badRequest(res, 'This phone number is already registered to another account.');
+  }
+
   await prisma.user.update({ where: { id: userId }, data: { name, phone } });
 
   if (user.flatId) {
     await prisma.flat.update({ where: { id: user.flatId }, data: { familyMembers } });
   }
 
-  return ok(res, null, 'Resident updated');
+  // A new phone number means a different person may now use this account, so the
+  // old PIN and every old login are wiped and a fresh activation code is issued.
+  const activation = phoneChanged
+    ? activationPayload(await issueActivationCode(userId, { resetPin: true }))
+    : null;
+
+  return ok(res, { activation }, phoneChanged ? 'Resident updated. Share the new activation code.' : 'Resident updated');
 }
 
 const addVehicleSchema = z.object({
@@ -360,13 +403,18 @@ export async function addStaff(req: Request, res: Response) {
   const wing = await prisma.wing.findUnique({ where: { id: req.user.wing_id } });
   if (!wing) return notFound(res, 'Wing not found');
 
+  const existing = await prisma.user.findUnique({ where: { phone } });
+  const conflict = phoneConflict(existing, { role: 'RESIDENT', wingId: req.user.wing_id });
+  if (conflict) return badRequest(res, conflict);
+
   const staff = await prisma.user.upsert({
     where: { phone },
     create: { name, phone, role: 'RESIDENT', societyId: wing.societyId, wingId: req.user.wing_id },
     update: { name, isActive: true },
   });
+  const activation = activationPayload(await codeIfNeeded(staff.id, existing));
 
-  return created(res, staff, 'Staff added');
+  return created(res, { id: staff.id, name: staff.name, phone: staff.phone, activation }, 'Staff added');
 }
 
 export async function getSecretaryProfile(req: Request, res: Response) {
@@ -390,14 +438,14 @@ export async function updateSecretaryUpi(req: Request, res: Response) {
   return ok(res, null, 'UPI ID saved successfully');
 }
 
-// The society-wide login code residents use in place of a real SMS OTP.
-// Secretary looks this up to share with residents when adding them.
-export async function getSocietyLoginCode(req: Request, res: Response) {
-  if (!req.user.society_id) return badRequest(res, 'No society associated with your account');
-  const society = await prisma.society.findUnique({
-    where: { id: req.user.society_id },
-    select: { name: true, demoOtpCode: true },
+// A forgotten PIN: wipes the old one, signs the person out everywhere, and issues
+// a new one-time activation code that the Secretary hands over.
+export async function resetResidentPin(req: Request, res: Response) {
+  const user = await prisma.user.findFirst({
+    where: { id: req.params.userId, wingId: req.user.wing_id, isActive: true, role: 'RESIDENT' },
   });
-  if (!society) return notFound(res, 'Society not found');
-  return ok(res, society);
+  if (!user) return notFound(res, 'Resident not found');
+
+  const issued = await issueActivationCode(user.id, { resetPin: true });
+  return ok(res, { name: user.name, phone: user.phone, activation: activationPayload(issued) }, 'PIN reset. Share the new code.');
 }

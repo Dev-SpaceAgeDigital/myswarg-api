@@ -15,11 +15,12 @@ import {
   addStaff,
   getSecretaryProfile,
   updateSecretaryUpi,
-  getSocietyLoginCode,
+  resetResidentPin,
 } from '../controllers/directory.controller';
 import { authenticate } from '../middleware/auth.middleware';
 import { requireRole } from '../middleware/roleGuard';
 import { wingGuard } from '../middleware/wingGuard';
+import { asyncSafe } from '../utils/asyncSafe';
 
 const router = Router();
 router.use(authenticate, wingGuard);
@@ -38,7 +39,7 @@ router.post('/guards', requireRole('WING_ADMIN'), addGuard);
 router.put('/guards/:guardId/pin', requireRole('WING_ADMIN'), updateGuardPin);
 router.post('/staff', requireRole('WING_ADMIN'), addStaff);
 router.get('/secretary/upi', requireRole('WING_ADMIN'), getSecretaryProfile);
-router.get('/society/login-code', requireRole('WING_ADMIN'), getSocietyLoginCode);
+router.post('/residents/:userId/reset-pin', requireRole('WING_ADMIN'), asyncSafe(resetResidentPin, 'resetResidentPin'));
 router.put('/secretary/upi', requireRole('WING_ADMIN'), updateSecretaryUpi);
 
 export default router;

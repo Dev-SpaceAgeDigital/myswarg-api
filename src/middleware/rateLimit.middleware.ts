@@ -38,7 +38,22 @@ export const verifyOtpIpLimiter = rateLimit({
   handler: tooMany('Too many attempts from this device. Please try again later.'),
 });
 
-// OTP "send" requests: 5 per hour per phone.
+// "Which screen should I show for this number?" lookups: 60 per IP per 15 minutes.
+export const checkPhoneLimiter = rateLimit({
+  windowMs: FIFTEEN_MIN,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  handler: tooMany('Too many attempts. Please try again in a few minutes.'),
+});
+
+// PIN / activation-code attempts reuse the per-phone and per-IP failure limiters above
+// (5 wrong tries per phone+IP, 30 per IP, per 15 minutes). On top of those, the
+// account itself locks for 15 minutes after 5 wrong tries, wherever they come from.
+export const pinPhoneLimiter = verifyOtpPhoneLimiter;
+export const pinIpLimiter = verifyOtpIpLimiter;
+
+// Legacy: OTP "send" requests: 5 per hour per phone (no longer routed).
 export const sendOtpLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   limit: 5,

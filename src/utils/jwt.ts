@@ -12,6 +12,8 @@ export interface JwtPayload {
   society_name?: string;
   // Login session id — only the most recent login for a user is accepted.
   sid?: string;
+  // Added by jsonwebtoken when the token is signed (seconds since epoch).
+  iat?: number;
 }
 
 export function signToken(payload: JwtPayload): string {

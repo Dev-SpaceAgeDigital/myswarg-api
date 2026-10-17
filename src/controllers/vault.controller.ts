@@ -62,6 +62,14 @@ export async function uploadVaultDocument(req: Request, res: Response) {
     // http_code is set by Cloudinary errors (401 = wrong key/secret, 400 = rejected file, 420 = rate limit)
     console.error('[uploadVaultDocument] Error:', err?.message, '| http_code:', err?.http_code ?? 'n/a',
       '| mime:', req.file?.mimetype, '| size:', req.file?.size);
+    // Cloudinary rejects password-protected or damaged PDFs/images with a message
+    // along these lines — tell the resident what to fix instead of a generic error.
+    if (/password|encrypt|protected|corrupt|invalid (image|file)|unsupported/i.test(err?.message ?? '')) {
+      return badRequest(
+        res,
+        'This file could not be read. If it is password-protected, remove the password first, or upload a different copy.',
+      );
+    }
     return res.status(500).json({ success: false, message: 'Upload failed. Please try again.' });
   }
 }

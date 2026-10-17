@@ -146,6 +146,17 @@ model User {
   notifications  Notification[]
   // Id of the most recent login; older tokens are rejected (one device per person).
   sessionId      String?
+
+  // ── PIN login ──────────────────────────────────────────────────────────────
+  // Both the PIN and the one-time activation code are stored hashed only.
+  pinHash             String?
+  pinSetAt            DateTime?
+  activationCodeHash  String?
+  activationExpiresAt DateTime?
+  pinFailedAttempts   Int       @default(0)
+  pinLockedUntil      DateTime?
+  // Tokens issued before this moment are rejected (set on PIN reset / change).
+  sessionsValidAfter  DateTime?
 }
 
 enum ResidentType {
