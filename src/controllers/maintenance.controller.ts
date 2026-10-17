@@ -325,6 +325,7 @@ export async function markPaid(req: Request, res: Response) {
     where: { id: req.params.id, wingId: req.user.wing_id },
   });
   if (!bill) return notFound(res, 'Bill not found');
+  if (bill.status === 'PAID') return badRequest(res, 'This bill is already marked as paid');
 
   const updatedBill = await prisma.maintenanceBill.update({
     where: { id: req.params.id },

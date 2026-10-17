@@ -7,6 +7,10 @@ cloudinary.config({
   api_secret: env.CLOUDINARY_API_SECRET,
 });
 
+if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
+  console.warn('[upload] Cloudinary variables are missing — photo and document uploads will fail.');
+}
+
 export async function uploadImage(filePath: string, folder: string): Promise<string> {
   const result = await cloudinary.uploader.upload(filePath, { folder });
   return result.secure_url;

@@ -59,7 +59,9 @@ export async function uploadVaultDocument(req: Request, res: Response) {
     });
     return created(res, doc, 'Document uploaded');
   } catch (err: any) {
-    console.error('[uploadVaultDocument] Error:', err.message);
+    // http_code is set by Cloudinary errors (401 = wrong key/secret, 400 = rejected file, 420 = rate limit)
+    console.error('[uploadVaultDocument] Error:', err?.message, '| http_code:', err?.http_code ?? 'n/a',
+      '| mime:', req.file?.mimetype, '| size:', req.file?.size);
     return res.status(500).json({ success: false, message: 'Upload failed. Please try again.' });
   }
 }

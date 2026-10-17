@@ -124,7 +124,8 @@ export async function deleteComplaint(req: Request, res: Response) {
     where: { id: req.params.id, userId: req.user.user_id, wingId: req.user.wing_id },
   });
   if (!complaint) return notFound(res, 'Complaint not found');
-  if (complaint.status !== 'OPEN') return badRequest(res, NOT_EDITABLE_MESSAGE);
+  // Deleting is allowed at any status (open, in progress or resolved) — it is the
+  // resident's own complaint. Only editing is limited to OPEN complaints.
 
   await prisma.complaint.delete({ where: { id: complaint.id } });
 
