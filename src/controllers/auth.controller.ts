@@ -87,5 +87,8 @@ export async function handleLogout(req: Request, res: Response) {
     await prisma.session.deleteMany({ where: { sessionToken: refresh_token } });
   }
 
+  // Stop phone alerts for this person on this phone once they sign out.
+  await prisma.user.updateMany({ where: { id: req.user.user_id }, data: { pushToken: null } });
+
   return ok(res, null, 'Logged out successfully');
 }

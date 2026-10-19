@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound } from '../utils/response';
 import { uploadPrivateBuffer, getSignedDownloadUrl } from '../services/upload.service';
-import { notifyWingAdmins, residentLabel } from '../services/notification.service';
+import { notifyWingAdmins, notifyUsers, notifyFlat, residentLabel } from '../services/notification.service';
 
 const generateBillsSchema = z.object({
   amount: z.number().positive(),
@@ -178,6 +178,23 @@ export async function generateBills(req: Request, res: Response) {
     ),
   );
 
+  // Tell every resident of those flats that a new bill is waiting.
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  prisma.user
+    .findMany({
+      where: { flatId: { in: occupiedFlats.map((f) => f.id) }, isActive: true, role: 'RESIDENT' },
+      select: { id: true },
+    })
+    .then((people) =>
+      notifyUsers({
+        userIds: people.map((p) => p.id),
+        title: 'New maintenance bill',
+        body: `Your ${MONTHS[month - 1]} ${year} bill of ₹${amount} is ready. Due ${new Date(due_date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}.`,
+        type: 'BILL_GENERATED',
+      }),
+    )
+    .catch((e) => console.error('[generateBills] notify failed:', e?.message ?? e));
+
   const generated = bills.length;
   const message = `Bills generated for ${generated} occupied flat${generated !== 1 ? 's' : ''}. ${skipped} vacant flat${skipped !== 1 ? 's' : ''} skipped.`;
 
@@ -299,6 +316,13 @@ export async function confirmPayment(req: Request, res: Response) {
     data: { status: 'PAID', paidAt: new Date() },
     include: { flat: { select: { number: true, floor: true } } },
   });
+  notifyFlat({
+    flatId: updated.flatId,
+    title: 'Payment confirmed',
+    body: `Your payment of ₹${updated.amount} was verified. Thank you!`,
+    type: 'PAYMENT_CONFIRMED',
+    relatedId: updated.id,
+  });
   return ok(res, updated, 'Payment confirmed');
 }
 
@@ -313,6 +337,13 @@ export async function rejectPayment(req: Request, res: Response) {
     where: { id: billId },
     data: { status: 'PENDING', paymentMode: null },
     include: { flat: { select: { number: true, floor: true } } },
+  });
+  notifyFlat({
+    flatId: updated.flatId,
+    title: 'Payment not verified',
+    body: `Your payment of ₹${updated.amount} could not be verified. Please pay again or contact your Secretary.`,
+    type: 'PAYMENT_REJECTED',
+    relatedId: updated.id,
   });
   return ok(res, updated, 'Payment rejected. Bill reset to pending.');
 }
@@ -331,6 +362,13 @@ export async function markPaid(req: Request, res: Response) {
     where: { id: req.params.id },
     data: { status: 'PAID', paymentMode: parsed.data.payment_mode, paidAt: new Date() },
     include: { flat: { select: { number: true, floor: true } } },
+  });
+  notifyFlat({
+    flatId: updatedBill.flatId,
+    title: 'Payment received',
+    body: `Your payment of ₹${updatedBill.amount} was recorded as paid (${parsed.data.payment_mode.toLowerCase()}).`,
+    type: 'PAYMENT_CONFIRMED',
+    relatedId: updatedBill.id,
   });
   return ok(res, updatedBill, 'Bill marked as paid');
 }

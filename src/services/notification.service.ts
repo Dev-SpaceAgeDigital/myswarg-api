@@ -1,4 +1,5 @@
 import { prisma } from '../config/db';
+import { pushToUsers } from './push.service';
 
 // Central place to fire in-app notifications whenever an approval-type
 // action happens (visitor approved/denied, booking approved/rejected,
@@ -23,6 +24,7 @@ export async function notifyUser(params: {
         relatedId: params.relatedId,
       },
     });
+    void pushToUsers([params.userId], params);
   } catch (err) {
     console.error('[notifyUser] Failed to create notification:', err);
   }
@@ -54,6 +56,7 @@ export async function notifyWingAdmins(params: {
         relatedId: params.relatedId,
       })),
     });
+    void pushToUsers(admins.map((a) => a.id), params);
   } catch (err) {
     console.error('[notifyWingAdmins] Failed to create notifications:', err);
   }
@@ -79,6 +82,7 @@ export async function notifyUsers(params: {
         relatedId: params.relatedId,
       })),
     });
+    void pushToUsers(params.userIds, params);
   } catch (err) {
     console.error('[notifyUsers] Failed to create notifications:', err);
   }
@@ -123,6 +127,7 @@ export async function notifyFlat(params: {
         relatedId: params.relatedId,
       })),
     });
+    void pushToUsers(users.map((u) => u.id), params);
   } catch (err) {
     console.error('[notifyFlat] Failed to create notifications:', err);
   }

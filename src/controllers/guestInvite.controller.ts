@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
+import { notifyFlat } from '../services/notification.service';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound, forbidden } from '../utils/response';
 
@@ -87,6 +88,14 @@ export async function verifyInviteCode(req: Request, res: Response) {
     where: { id: invite.id },
     data: { status: 'USED', usedAt: new Date(), createdVisitorId: visitor.id } as any,
     include: { flat: { select: { number: true, floor: true } } },
+  });
+
+  notifyFlat({
+    flatId: invite.flatId,
+    title: 'Your guest has arrived',
+    body: `${invite.guestName} was let in using the guest code.`,
+    type: 'VISITOR_APPROVED',
+    relatedId: visitor.id,
   });
 
   return ok(res, updated, `Entry approved for ${invite.guestName} (Flat ${invite.flat.number})`);

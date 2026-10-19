@@ -155,6 +155,8 @@ model User {
   activationExpiresAt DateTime?
   pinFailedAttempts   Int       @default(0)
   pinLockedUntil      DateTime?
+  // Expo push token of the phone this person is signed in on (one device per person).
+  pushToken           String?
   // Tokens issued before this moment are rejected (set on PIN reset / change).
   sessionsValidAfter  DateTime?
 }

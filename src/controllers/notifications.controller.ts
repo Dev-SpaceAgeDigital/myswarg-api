@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, notFound, badRequest, forbidden } from '../utils/response';
 import { notifyUser } from '../services/notification.service';
+import { isExpoPushToken } from '../services/push.service';
 
 const leaveRequestSchema = z.object({
   leaving_date: z.string().min(1),
@@ -87,4 +88,24 @@ export async function markAllNotificationsRead(req: Request, res: Response) {
     data: { read: true },
   });
   return ok(res, null, 'All notifications marked as read');
+}
+
+// The app registers the phone's push token after sign-in so alerts arrive even
+// when the app is closed. A token belongs to one phone, so if another account
+// was signed in on the same phone before, that account stops receiving it.
+export async function registerPushToken(req: Request, res: Response) {
+  const token = req.body?.token;
+  if (!isExpoPushToken(token)) return badRequest(res, 'Invalid push token');
+
+  await prisma.user.updateMany({
+    where: { pushToken: token, id: { not: req.user.user_id } },
+    data: { pushToken: null },
+  });
+  await prisma.user.update({ where: { id: req.user.user_id }, data: { pushToken: token } });
+  return ok(res, null, 'Push alerts enabled');
+}
+
+export async function clearPushToken(req: Request, res: Response) {
+  await prisma.user.update({ where: { id: req.user.user_id }, data: { pushToken: null } });
+  return ok(res, null, 'Push alerts disabled');
 }

@@ -56,11 +56,18 @@ export async function logVisitor(req: Request, res: Response) {
       photoUrl,
       purpose: parsed.data.purpose,
       deliveryHandling: parsed.data.delivery_handling,
-      status: 'APPROVED',
-      entryTime: new Date(),
+      // The visitor waits at the gate until someone from the flat approves.
+      status: 'PENDING',
     },
   });
-  return created(res, visitor, 'Visitor logged');
+  notifyFlat({
+    flatId: visitor.flatId,
+    title: 'Visitor at the gate',
+    body: `${visitor.visitorName}${visitor.purpose ? ` (${visitor.purpose})` : ''} is waiting at the gate. Approve or deny entry.`,
+    type: 'VISITOR_AT_GATE',
+    relatedId: visitor.id,
+  });
+  return created(res, visitor, 'Visitor logged. Waiting for the resident to approve.');
 }
 
 export async function approveVisitor(req: Request, res: Response) {
@@ -68,6 +75,7 @@ export async function approveVisitor(req: Request, res: Response) {
     where: { id: req.params.id, wingId: req.user.wing_id, flatId: req.user.flat_id ?? undefined },
   });
   if (!visitor) return notFound(res, 'Visitor not found');
+  if (visitor.status !== 'PENDING') return badRequest(res, `This visitor was already ${visitor.status.toLowerCase()}.`);
 
   const updated = await prisma.visitor.update({
     where: { id: req.params.id },
@@ -88,6 +96,7 @@ export async function denyVisitor(req: Request, res: Response) {
     where: { id: req.params.id, wingId: req.user.wing_id, flatId: req.user.flat_id ?? undefined },
   });
   if (!visitor) return notFound(res, 'Visitor not found');
+  if (visitor.status !== 'PENDING') return badRequest(res, `This visitor was already ${visitor.status.toLowerCase()}.`);
 
   const updated = await prisma.visitor.update({
     where: { id: req.params.id },
@@ -106,6 +115,8 @@ export async function denyVisitor(req: Request, res: Response) {
 export async function logVisitorExit(req: Request, res: Response) {
   const visitor = await prisma.visitor.findFirst({ where: { id: req.params.id, wingId: req.user.wing_id } });
   if (!visitor) return notFound(res, 'Visitor not found');
+  if (visitor.status !== 'APPROVED') return badRequest(res, 'Only an approved visitor can be logged out.');
+  if (visitor.exitTime) return badRequest(res, 'Exit was already logged.');
 
   const updated = await prisma.visitor.update({ where: { id: req.params.id }, data: { exitTime: new Date() } });
   return ok(res, updated, 'Exit logged');
