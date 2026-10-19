@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound } from '../utils/response';
+import { cascadeDelete } from '../services/cascadeDelete.service';
 import { codeIfNeeded, issueActivationCode, phoneConflict, pinSummaryOf, IssuedCode } from '../services/pin.service';
 
 // What the Command Centre shows once, right after a code is issued.
@@ -130,45 +131,27 @@ export async function updateSociety(req: Request, res: Response) {
 export async function deleteSociety(req: Request, res: Response) {
   const { id } = req.params;
   try {
-    const wings = await prisma.wing.findMany({ where: { societyId: id }, select: { id: true } });
-    const wingIds = wings.map((w) => w.id);
+    const society = await prisma.society.findUnique({ where: { id }, select: { id: true } });
+    if (!society) return notFound(res, 'Society not found');
 
-    if (wingIds.length > 0) {
-      const flats = await prisma.flat.findMany({ where: { wingId: { in: wingIds } }, select: { id: true } });
-      const flatIds = flats.map((f) => f.id);
+    await prisma.$transaction(async (tx) => {
+      const wings = await tx.wing.findMany({ where: { societyId: id }, select: { id: true } });
+      const wingIds = wings.map((w) => w.id);
 
-      if (flatIds.length > 0) {
-        await prisma.maintenanceBill.deleteMany({ where: { flatId: { in: flatIds } } });
-        await prisma.vehicle.deleteMany({ where: { flatId: { in: flatIds } } });
-      }
-
-      await prisma.visitor.deleteMany({ where: { wingId: { in: wingIds } } });
-      await prisma.complaint.deleteMany({ where: { wingId: { in: wingIds } } });
-
-      const notices = await prisma.notice.findMany({ where: { wingId: { in: wingIds } }, select: { id: true } });
-      if (notices.length > 0) {
-        await prisma.noticeSeen.deleteMany({ where: { noticeId: { in: notices.map((n) => n.id) } } });
-        await prisma.notice.deleteMany({ where: { wingId: { in: wingIds } } });
-      }
-
-      await prisma.session.deleteMany({
-        where: { user: { wingId: { in: wingIds }, role: { notIn: ['SUPER_ADMIN', 'GUARD'] } } },
+      // Residents, secretaries and staff go with the society (and everything they own).
+      // Platform owners and guards are kept; they are just detached by the cascade below.
+      const people = await tx.user.findMany({
+        where: {
+          OR: [{ societyId: id }, ...(wingIds.length ? [{ wingId: { in: wingIds } }] : [])],
+          role: { notIn: ['SUPER_ADMIN', 'GUARD'] },
+        },
+        select: { id: true },
       });
-      await prisma.user.deleteMany({
-        where: { wingId: { in: wingIds }, role: { notIn: ['SUPER_ADMIN', 'GUARD'] } },
-      });
+      await cascadeDelete(tx, 'User', people.map((u) => u.id));
 
-      // Detach system users from this wing so wing deletion succeeds
-      await prisma.user.updateMany({
-        where: { wingId: { in: wingIds }, role: { in: ['SUPER_ADMIN', 'GUARD'] } },
-        data: { wingId: null, societyId: null },
-      });
-
-      await prisma.flat.deleteMany({ where: { wingId: { in: wingIds } } });
-      await prisma.wing.deleteMany({ where: { societyId: id } });
-    }
-
-    await prisma.society.delete({ where: { id } });
+      // Wings, flats, bills, complaints, amenities... every table that points at them.
+      await cascadeDelete(tx, 'Society', [id]);
+    }, { timeout: 120000, maxWait: 15000 });
 
     // Re-attach system users to the next available society/wing
     const remainingSociety = await prisma.society.findFirst({ orderBy: { createdAt: 'asc' } });
@@ -542,38 +525,14 @@ export async function deleteWing(req: Request, res: Response) {
     const wing = await prisma.wing.findUnique({ where: { id: wingId } });
     if (!wing) return res.status(404).json({ success: false, message: 'Wing not found' });
 
-    const flats = await prisma.flat.findMany({ where: { wingId }, select: { id: true } });
-    const flatIds = flats.map((f) => f.id);
-
-    if (flatIds.length > 0) {
-      await prisma.maintenanceBill.deleteMany({ where: { flatId: { in: flatIds } } });
-      await prisma.vehicle.deleteMany({ where: { flatId: { in: flatIds } } });
-    }
-
-    const notices = await prisma.notice.findMany({ where: { wingId }, select: { id: true } });
-    if (notices.length > 0) {
-      await prisma.noticeSeen.deleteMany({ where: { noticeId: { in: notices.map((n) => n.id) } } });
-    }
-
-    await prisma.visitor.deleteMany({ where: { wingId } });
-    await prisma.complaint.deleteMany({ where: { wingId } });
-    await prisma.notice.deleteMany({ where: { wingId } });
-
-    await prisma.session.deleteMany({
-      where: { user: { wingId, role: { notIn: ['SUPER_ADMIN', 'GUARD'] } } },
-    });
-
-    await prisma.user.updateMany({
-      where: { wingId, role: { in: ['SUPER_ADMIN', 'GUARD'] } },
-      data: { wingId: null },
-    });
-
-    await prisma.user.deleteMany({
-      where: { wingId, role: { notIn: ['SUPER_ADMIN', 'GUARD'] } },
-    });
-
-    await prisma.flat.deleteMany({ where: { wingId } });
-    await prisma.wing.delete({ where: { id: wingId } });
+    await prisma.$transaction(async (tx) => {
+      const people = await tx.user.findMany({
+        where: { wingId, role: { notIn: ['SUPER_ADMIN', 'GUARD'] } },
+        select: { id: true },
+      });
+      await cascadeDelete(tx, 'User', people.map((u) => u.id));
+      await cascadeDelete(tx, 'Wing', [wingId]);
+    }, { timeout: 120000, maxWait: 15000 });
 
     return res.json({ success: true, message: 'Wing deleted successfully' });
   } catch (error: any) {
