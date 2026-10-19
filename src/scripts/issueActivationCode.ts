@@ -6,6 +6,9 @@
  * Run it on the server (Railway → myswarg-api → Console):
  *     node dist/scripts/issueActivationCode.js 9XXXXXXXXX
  *
+ * If the Super Admin does not exist yet (fresh database), create them too:
+ *     node dist/scripts/issueActivationCode.js 9XXXXXXXXX --create-super-admin "Your Name"
+ *
  * The person then opens the app (or Command Centre), enters their phone number,
  * the code shown here, and chooses their own PIN. The old PIN (if any) stops working.
  */
@@ -18,9 +21,15 @@ async function main() {
     console.error('Usage: node dist/scripts/issueActivationCode.js <10-digit phone>');
     process.exit(1);
   }
-  const user = await prisma.user.findUnique({ where: { phone } });
+  let user = await prisma.user.findUnique({ where: { phone } });
+  const createFlag = process.argv.indexOf('--create-super-admin');
+  if (createFlag !== -1 && !user) {
+    const name = (process.argv[createFlag + 1] ?? '').trim() || 'Super Admin';
+    user = await prisma.user.create({ data: { name, phone, role: 'SUPER_ADMIN' } });
+    console.log(`Created Super Admin account for ${phone}.`);
+  }
   if (!user || !user.isActive) {
-    console.error(`No active account found for ${phone}.`);
+    console.error(`No active account found for ${phone}. To create the Super Admin, add: --create-super-admin "Your Name"`);
     process.exit(1);
   }
   const issued = await issueActivationCode(user.id, { resetPin: true });
