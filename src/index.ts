@@ -1,4 +1,5 @@
 import './config/env';
+import { startReminderSchedule } from './services/reminders.service';
 import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import morgan from 'morgan';
@@ -105,6 +106,7 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 const startServer = async () => {
   // Listen immediately so Railway's proxy can reach the server right away
   app.listen(PORT as any, '0.0.0.0', () => {
+    if (process.env.NODE_ENV !== 'test') startReminderSchedule();
     console.log(`Server started on PORT ${PORT}`);
   });
 

@@ -21,6 +21,8 @@ model Society {
   planType           String    @default("STARTER")
   monthlyAmount      Float     @default(499)
   demoOtpCode        String?
+  // Short code guards type to pick their society at sign-in (e.g. K7M2QX).
+  code               String?   @unique
   subscriptionStart  DateTime  @default(now())
   subscriptionEnd    DateTime?
   trialEndsAt        DateTime?
@@ -126,6 +128,8 @@ model User {
   familyMembers Int           @default(1)
   isPrimary     Boolean       @default(false)
   guardPin      String?
+  // Guard PIN, stored hashed. guardPin above is only read for older accounts and cleared on first sign-in.
+  guardPinHash  String?
   upiId         String?
   societyId     String?
   wingId       String?
@@ -200,6 +204,9 @@ model MaintenanceBill {
   proofResourceType String?
   proofFormat       String?
   lateFeeApplied    Float        @default(0)
+  // Automatic reminders already sent, so each goes out only once.
+  dueReminderSentAt     DateTime?
+  overdueReminderSentAt DateTime?
   createdAt   DateTime     @default(now())
 
   @@unique([flatId, month, year])
@@ -307,6 +314,8 @@ model Visitor {
   purpose          String?
   deliveryHandling DeliveryHandling?
   approvedBy       String?
+  // How entry was allowed: RESIDENT (in the app), PHONE_CALL (guard called the flat), GUEST_CODE, PASS
+  approvalMethod   String?
   status           VisitorStatus     @default(PENDING)
   entryTime        DateTime?
   exitTime         DateTime?
@@ -536,6 +545,10 @@ model GuestInvite {
   status          GuestInviteStatus @default(PENDING)
   createdVisitorId String?
   usedAt          DateTime?
+  // A pass (daily help, driver, regular delivery) can be used every day until validUntil.
+  isPass          Boolean           @default(false)
+  validUntil      DateTime?
+  useCount        Int               @default(0)
   createdAt       DateTime          @default(now())
 }
 

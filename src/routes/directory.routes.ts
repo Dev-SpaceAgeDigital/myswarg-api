@@ -12,6 +12,8 @@ import {
   getGuards,
   addGuard,
   updateGuardPin,
+  listSecretaries,
+  resetSecretaryPin,
   addStaff,
   getSecretaryProfile,
   updateSecretaryUpi,
@@ -37,6 +39,8 @@ router.delete('/vehicles/:id', requireRole('WING_ADMIN'), deleteVehicle);
 router.get('/guards', requireRole('WING_ADMIN'), getGuards);
 router.post('/guards', requireRole('WING_ADMIN'), addGuard);
 router.put('/guards/:guardId/pin', requireRole('WING_ADMIN'), updateGuardPin);
+router.get('/secretaries', requireRole('WING_ADMIN'), asyncSafe(listSecretaries, 'listSecretaries'));
+router.post('/secretaries/:userId/reset-pin', requireRole('WING_ADMIN'), asyncSafe(resetSecretaryPin, 'resetSecretaryPin'));
 router.post('/staff', requireRole('WING_ADMIN'), addStaff);
 router.get('/secretary/upi', requireRole('WING_ADMIN'), getSecretaryProfile);
 router.post('/residents/:userId/reset-pin', requireRole('WING_ADMIN'), asyncSafe(resetResidentPin, 'resetResidentPin'));

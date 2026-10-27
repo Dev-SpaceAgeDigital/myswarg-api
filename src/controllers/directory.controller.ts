@@ -2,7 +2,9 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound } from '../utils/response';
-import { codeIfNeeded, issueActivationCode, phoneConflict, pinSummaryOf, IssuedCode } from '../services/pin.service';
+import { codeIfNeeded, issueActivationCode, phoneConflict, pinSummaryOf, IssuedCode, hashSecret, compareSecret, weakPinReason } from '../services/pin.service';
+import { ensureSocietyCode } from '../services/societyCode.service';
+import { scopeWingIds, isSocietyGuard } from '../middleware/wingGuard';
 
 // What the app shows once, right after a code is issued.
 function activationPayload(c: IssuedCode | null) {
@@ -46,7 +48,7 @@ const addResidentSchema = z.object({
 const addGuardSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   phone: z.string().regex(/^[6-9]\d{9}$/, 'Invalid mobile number'),
-  pin: z.string().length(4).regex(/^\d{4}$/, 'PIN must be 4 digits'),
+  pin: z.string().regex(/^\d{6}$/, 'Guard PIN must be 6 digits'),
 });
 
 export async function listFlats(req: Request, res: Response) {
@@ -54,7 +56,7 @@ export async function listFlats(req: Request, res: Response) {
     const wingId = req.user.wing_id;
     console.log('[listFlats] User wing_id:', wingId, 'role:', req.user.role);
 
-    if (!wingId) {
+    if (!wingId && !isSocietyGuard(req)) {
       return res.status(400).json({
         success: false,
         message: 'Wing not assigned. Contact Super Admin.',
@@ -65,7 +67,7 @@ export async function listFlats(req: Request, res: Response) {
 
     const flats = await prisma.flat.findMany({
       where: {
-        wingId,
+        wingId: { in: await scopeWingIds(req) },
         ...(vacantOnly ? { users: { none: { isActive: true } } } : {}),
       },
       include: {
@@ -254,19 +256,51 @@ export async function removeResident(req: Request, res: Response) {
   return ok(res, null, 'Resident removed');
 }
 
+// Guards sign in with the society code and their own PIN, so no two guards of
+// the same society may share a PIN: the PIN is what tells them apart.
+async function pinUsedByAnotherGuard(societyId: string, pin: string, exceptId?: string): Promise<boolean> {
+  const others = await prisma.user.findMany({
+    where: {
+      role: 'GUARD', isActive: true,
+      OR: [{ societyId }, { wing: { societyId } }],
+      ...(exceptId ? { id: { not: exceptId } } : {}),
+    },
+    select: { guardPin: true, guardPinHash: true },
+  });
+  for (const g of others) {
+    if (g.guardPinHash && (await compareSecret(pin, g.guardPinHash))) return true;
+    if (!g.guardPinHash && g.guardPin === pin) return true;
+  }
+  return false;
+}
+
+// Guards this Secretary manages: their own wing's guards plus the guards who
+// cover every tower of the society.
+function guardsWhere(wingId: string, societyId: string) {
+  return { role: 'GUARD' as const, isActive: true, OR: [{ wingId }, { wingId: null, societyId }] };
+}
+
 export async function getGuards(req: Request, res: Response) {
-  const [guards, wing] = await Promise.all([
-    prisma.user.findMany({
-      where: { wingId: req.user.wing_id, role: 'GUARD', isActive: true },
-      select: { id: true, name: true, phone: true, guardPin: true, createdAt: true },
-      orderBy: { createdAt: 'asc' },
-    }),
-    prisma.wing.findUnique({
-      where: { id: req.user.wing_id },
-      select: { name: true },
-    }),
-  ]);
-  return ok(res, { guards, wingName: wing?.name ?? '' });
+  const wing = await prisma.wing.findUnique({
+    where: { id: req.user.wing_id },
+    select: { name: true, societyId: true, society: { select: { _count: { select: { wings: true } } } } },
+  });
+  if (!wing) return notFound(res, 'Wing not found');
+  const guards = await prisma.user.findMany({
+    where: guardsWhere(req.user.wing_id, wing.societyId),
+    select: { id: true, name: true, phone: true, wingId: true, guardPinHash: true, guardPin: true, createdAt: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  const societyCode = await ensureSocietyCode(wing.societyId);
+  return ok(res, {
+    // PINs are never sent back, only whether one is set.
+    guards: guards.map(({ guardPinHash, guardPin, wingId, ...g }) => ({
+      ...g, hasPin: !!(guardPinHash || guardPin), allTowers: !wingId,
+    })),
+    wingName: wing.name,
+    societyCode,
+    towerCount: wing.society._count.wings,
+  });
 }
 
 export async function addGuard(req: Request, res: Response) {
@@ -274,6 +308,9 @@ export async function addGuard(req: Request, res: Response) {
   if (!parsed.success) return badRequest(res, parsed.error.errors[0].message);
 
   const { name, phone, pin } = parsed.data;
+  const allTowers = req.body?.all_towers !== false; // default: the guard covers every tower
+  const weak = weakPinReason(pin);
+  if (weak) return badRequest(res, weak);
 
   const wing = await prisma.wing.findUnique({ where: { id: req.user.wing_id } });
   if (!wing) return notFound(res, 'Wing not found');
@@ -283,21 +320,19 @@ export async function addGuard(req: Request, res: Response) {
   if (existing && existing.role !== 'GUARD') {
     return badRequest(res, `Phone ${phone} is already registered to another user`);
   }
+  if (existing && existing.isActive && existing.societyId && existing.societyId !== wing.societyId) {
+    return badRequest(res, 'This guard is already registered with another society.');
+  }
+  if (await pinUsedByAnotherGuard(wing.societyId, pin, existing?.id)) {
+    return badRequest(res, 'Another guard of this society already uses this PIN. Please choose a different one.');
+  }
 
+  const guardPinHash = await hashSecret(pin);
+  const wingId = allTowers ? null : req.user.wing_id;
   const guard = await prisma.user.upsert({
     where: { phone },
-    create: {
-      name, phone, role: 'GUARD',
-      guardPin: pin,
-      societyId: wing.societyId,
-      wingId: req.user.wing_id,
-    },
-    update: {
-      name, role: 'GUARD',
-      guardPin: pin,
-      wingId: req.user.wing_id,
-      isActive: true,
-    },
+    create: { name, phone, role: 'GUARD', guardPinHash, societyId: wing.societyId, wingId },
+    update: { name, role: 'GUARD', guardPinHash, guardPin: null, societyId: wing.societyId, wingId, isActive: true },
   });
 
   return created(res, { id: guard.id, name: guard.name }, 'Guard added');
@@ -305,18 +340,21 @@ export async function addGuard(req: Request, res: Response) {
 
 export async function updateGuardPin(req: Request, res: Response) {
   const { guardId } = req.params;
-  const { pin } = req.body;
+  const pin = String(req.body?.pin ?? '');
 
-  if (!pin || !/^\d{4}$/.test(pin)) {
-    return badRequest(res, 'PIN must be exactly 4 digits');
+  if (!/^\d{6}$/.test(pin)) return badRequest(res, 'Guard PIN must be 6 digits');
+  const weak = weakPinReason(pin);
+  if (weak) return badRequest(res, weak);
+
+  const wing = await prisma.wing.findUnique({ where: { id: req.user.wing_id }, select: { societyId: true } });
+  if (!wing) return notFound(res, 'Wing not found');
+  const guard = await prisma.user.findFirst({ where: { id: guardId, ...guardsWhere(req.user.wing_id, wing.societyId) } });
+  if (!guard) return notFound(res, 'Guard not found');
+  if (await pinUsedByAnotherGuard(wing.societyId, pin, guardId)) {
+    return badRequest(res, 'Another guard of this society already uses this PIN. Please choose a different one.');
   }
 
-  const guard = await prisma.user.findFirst({
-    where: { id: guardId, wingId: req.user.wing_id, role: 'GUARD' },
-  });
-  if (!guard) return notFound(res, 'Guard not found');
-
-  await prisma.user.update({ where: { id: guardId }, data: { guardPin: pin } });
+  await prisma.user.update({ where: { id: guardId }, data: { guardPinHash: await hashSecret(pin), guardPin: null } });
   return ok(res, null, 'PIN updated successfully');
 }
 
@@ -448,4 +486,28 @@ export async function resetResidentPin(req: Request, res: Response) {
 
   const issued = await issueActivationCode(user.id, { resetPin: true });
   return ok(res, { name: user.name, phone: user.phone, activation: activationPayload(issued) }, 'PIN reset. Share the new code.');
+}
+
+// ─── Co-secretaries ──────────────────────────────────────────────────────────
+// A wing can have two Secretaries. Each can reset the other's PIN, so a
+// forgotten PIN doesn't need the platform team.
+export async function listSecretaries(req: Request, res: Response) {
+  const people = await prisma.user.findMany({
+    where: { wingId: req.user.wing_id, role: 'WING_ADMIN', isActive: true },
+    select: { id: true, name: true, phone: true, isPrimary: true, pinSetAt: true, activationCodeHash: true, activationExpiresAt: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  return ok(res, people.map((p) => ({ ...withPinSummary(p), isMe: p.id === req.user.user_id })));
+}
+
+export async function resetSecretaryPin(req: Request, res: Response) {
+  if (req.params.userId === req.user.user_id) {
+    return badRequest(res, 'Use Change PIN for your own account. If you forgot it, ask your co-secretary or MySwarg support.');
+  }
+  const target = await prisma.user.findFirst({
+    where: { id: req.params.userId, wingId: req.user.wing_id, role: 'WING_ADMIN', isActive: true },
+  });
+  if (!target) return notFound(res, 'Secretary not found');
+  const issued = await issueActivationCode(target.id, { resetPin: true });
+  return ok(res, { name: target.name, phone: target.phone, activation: activationPayload(issued) }, 'PIN reset. Share the new code.');
 }

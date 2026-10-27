@@ -71,7 +71,7 @@ export const guardLoginLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   skipSuccessfulRequests: true,
-  keyGenerator: (req) => `${req.ip}:${String(req.body?.wing_code || '').trim().toLowerCase()}`,
+  keyGenerator: (req) => `${req.ip}:${String(req.body?.society_code || req.body?.wing_code || '').trim().toLowerCase()}`,
   handler: tooMany('Too many wrong attempts. Please try again in 15 minutes.'),
 });
 

@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/db';
 import { ok, created, badRequest, notFound } from '../utils/response';
+import { uniqueSocietyCode } from '../services/societyCode.service';
 import { cascadeDelete } from '../services/cascadeDelete.service';
 import { codeIfNeeded, issueActivationCode, phoneConflict, pinSummaryOf, IssuedCode } from '../services/pin.service';
 
@@ -89,7 +90,7 @@ export async function createSociety(req: Request, res: Response) {
   const parsed = createSocietySchema.safeParse(req.body);
   if (!parsed.success) return badRequest(res, parsed.error.errors[0].message);
   const newSociety = await prisma.society.create({
-    data: parsed.data as any,
+    data: { ...(parsed.data as any), code: await uniqueSocietyCode() },
   });
 
   const trialEnd = new Date();

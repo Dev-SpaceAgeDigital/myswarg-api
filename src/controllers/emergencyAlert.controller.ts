@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { prisma } from '../config/db';
+import { scopeWingIds } from '../middleware/wingGuard';
 import { ok, created, badRequest, notFound } from '../utils/response';
 import { notifyUser, notifyUsers, notifyWingAdmins, residentLabel } from '../services/notification.service';
 
@@ -17,7 +18,7 @@ export async function raiseAlert(req: Request, res: Response) {
       data: { wingId, flatId, raisedById: req.user.user_id },
     }),
     prisma.user.findFirst({
-      where: { wingId, role: 'GUARD', isActive: true },
+      where: { role: 'GUARD', isActive: true, OR: [{ wingId }, { wingId: null, societyId: req.user.society_id || undefined }] },
       select: { name: true, phone: true },
     }),
     prisma.user.findFirst({
@@ -31,7 +32,10 @@ export async function raiseAlert(req: Request, res: Response) {
     const body = `${who} has raised an emergency alert. Please respond immediately.`;
     await notifyWingAdmins({ wingId, title, body, type: 'EMERGENCY_ALERT', relatedId: alert.id });
     // The guards on duty get a phone alert too, so the gate responds at once.
-    const guards = await prisma.user.findMany({ where: { wingId, role: 'GUARD', isActive: true }, select: { id: true } });
+    const guards = await prisma.user.findMany({
+      where: { role: 'GUARD', isActive: true, OR: [{ wingId }, { wingId: null, societyId: req.user.society_id || undefined }] },
+      select: { id: true },
+    });
     await notifyUsers({ userIds: guards.map((g) => g.id), title, body, type: 'EMERGENCY_ALERT', relatedId: alert.id });
   });
 
@@ -45,7 +49,7 @@ export async function raiseAlert(req: Request, res: Response) {
 // Guard/Secretary — active alerts across the wing.
 export async function listActiveAlerts(req: Request, res: Response) {
   const alerts = await prisma.emergencyAlert.findMany({
-    where: { wingId: req.user.wing_id, status: 'ACTIVE' },
+    where: { wingId: { in: await scopeWingIds(req) }, status: 'ACTIVE' },
     include: {
       flat: { select: { number: true, floor: true } },
       raisedBy: { select: { name: true, phone: true } },
@@ -57,7 +61,7 @@ export async function listActiveAlerts(req: Request, res: Response) {
 
 export async function resolveAlert(req: Request, res: Response) {
   const { id } = req.params;
-  const alert = await prisma.emergencyAlert.findFirst({ where: { id, wingId: req.user.wing_id } });
+  const alert = await prisma.emergencyAlert.findFirst({ where: { id, wingId: { in: await scopeWingIds(req) } } });
   if (!alert) return notFound(res, 'Alert not found');
   if (alert.status === 'RESOLVED') return badRequest(res, 'Already resolved');
 
